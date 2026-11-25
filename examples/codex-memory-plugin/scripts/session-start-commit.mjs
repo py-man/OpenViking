@@ -472,6 +472,7 @@ runHookStage({
       // archive-now commit, so catch them up first and keep the session live
       // for the next sweep if any of them failed to land.
       const { newTurns, added, skipped, unreadable } = await catchUpTurns({
+        streamRecovery: true,
         state: fresh,
         transcriptPath: fresh.transcriptPath,
         fetchJSONRes: sweepFetchJSONRes,

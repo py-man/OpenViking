@@ -10,8 +10,9 @@
  * `session-state.mjs`, so it does not belong under `scripts/shared/`.
  */
 
-import { readFile } from "node:fs/promises";
-import { extractCaptureTranscript, findLastHumanTurnIndex } from "./capture-utils.mjs";
+import { open, readFile } from "node:fs/promises";
+import { createInterface } from "node:readline";
+import { extractRolloutStream, extractCaptureTranscript, findLastHumanTurnIndex } from "./capture-utils.mjs";
 import { CAPTURE_FORMAT_VERSION, resolveOvSessionId, saveState } from "./session-state.mjs";
 import { makeAgentFetchJSON } from "./shared/agent-hook-runtime.mjs";
 import { sendSessionMessages } from "./shared/batch-send.mjs";
@@ -65,9 +66,46 @@ function parseTranscript(content) {
  * Callers must not treat `ok: false` as a transcript shrink — resetting the
  * cursor on a transient read error replays the whole session.
  */
-export async function readTranscriptTurns(transcriptPath, cfg, logError) {
+export async function readTranscriptTurns(transcriptPath, cfg, logError, { streamRecovery = false, skipTurns = 0 } = {}) {
   if (!transcriptPath) return { turns: [], excludedLegacyTurnIndices: [], ok: false };
   try {
+    if (streamRecovery && transcriptPath.endsWith(".jsonl")) {
+      const fd = await open(transcriptPath, "r");
+      try {
+        const snapshot = await fd.stat({ bigint: true });
+        const size = Number(snapshot.size);
+        if (size > 8 * 1024 * 1024) {
+          // JSON arrays (including legacy files named .jsonl) retain their parser.
+          const header = Buffer.alloc(4096);
+          const { bytesRead } = await fd.read(header, 0, header.length, 0);
+          if (header.toString("utf8", 0, bytesRead).trimStart().startsWith("{")) {
+            async function* records() {
+              const stream = fd.createReadStream({ start: 0, end: size - 1, autoClose: false });
+              const lines = createInterface({ input: stream, crlfDelay: Infinity });
+              try {
+                for await (const line of lines) {
+                  let record;
+                  try { record = JSON.parse(line); } catch { continue; }
+                  yield record;
+                }
+              } finally {
+                lines.close();
+              }
+            }
+            let result = await extractRolloutStream(records, cfg, skipTurns);
+            // A compaction needs its last human turn, including the old prefix.
+            if (result.turns.length < skipTurns) result = await extractRolloutStream(records, cfg, 0);
+            const end = await fd.stat({ bigint: true });
+            if (end.size !== snapshot.size || end.ctimeNs !== snapshot.ctimeNs) {
+              throw new Error("rollout changed during recovery");
+            }
+            return { ...result, ok: true };
+          }
+        }
+      } finally {
+        await fd.close();
+      }
+    }
     const raw = await readFile(transcriptPath, "utf-8");
     if (!raw.trim()) return { turns: [], excludedLegacyTurnIndices: [], ok: true };
     return { ...extractCaptureTranscript(parseTranscript(raw), cfg), ok: true };
@@ -108,12 +146,16 @@ export async function catchUpTurns({
   logError,
   heartbeat,
   shouldSend,
+  streamRecovery = false,
 }) {
   // Remember the rollout path so the SessionStart sweep can catch up turns for
   // a session whose Stop/SessionEnd workers never ran.
   if (transcriptPath) state.transcriptPath = transcriptPath;
 
-  const { turns, excludedLegacyTurnIndices, ok } = await readTranscriptTurns(transcriptPath, cfg, logError);
+  const { turns, excludedLegacyTurnIndices, ok } = await readTranscriptTurns(transcriptPath, cfg, logError, {
+    streamRecovery,
+    skipTurns: state.captureFormatVersion === CAPTURE_FORMAT_VERSION ? state.capturedTurnCount : 0,
+  });
 
   if (ok && state.captureFormatVersion !== CAPTURE_FORMAT_VERSION) {
     const oldCursor = Math.max(0, Number(state.capturedTurnCount) || 0);
