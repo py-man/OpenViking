@@ -1,4 +1,5 @@
 import {
+  collectToolNamesByIdFromEntries,
   extractCaptureTurns as extractSharedCaptureTurns,
 } from "./shared/capture-utils.mjs";
 
@@ -84,7 +85,7 @@ function isFailed(payload) {
     || Boolean(payload?.error);
 }
 
-function completedToolEvent(entry) {
+function completedToolEvent(entry, identityOnly = false) {
   const payload = entry?.payload;
   if (payload?.type === "mcp_tool_call_end") {
     const hasResult = Object.prototype.hasOwnProperty.call(payload.result || {}, "Ok");
@@ -94,7 +95,7 @@ function completedToolEvent(entry) {
       id: payload.call_id,
       name: payload.invocation?.tool,
       input: payload.invocation?.arguments ?? {},
-      output: mcpResultText(payload.result),
+      output: identityOnly ? undefined : mcpResultText(payload.result),
       failed,
     };
   }
@@ -104,7 +105,7 @@ function completedToolEvent(entry) {
       id: payload.id,
       name: payload.tool,
       input: payload.arguments ?? {},
-      output: mcpResultText(payload.error ?? payload.result),
+      output: identityOnly ? undefined : mcpResultText(payload.error ?? payload.result),
       failed: isFailed(payload) || payload.result?.isError === true,
     };
   }
@@ -119,7 +120,7 @@ function completedToolEvent(entry) {
         source: payload.source,
         interaction_input: payload.interaction_input,
       }),
-      output: payload.aggregated_output ?? payload.formatted_output ?? joinedOutput(payload),
+      output: identityOnly ? undefined : payload.aggregated_output ?? payload.formatted_output ?? joinedOutput(payload),
       failed: isFailed(payload),
     };
   }
@@ -132,7 +133,7 @@ function completedToolEvent(entry) {
         changes: payload.changes,
         auto_approved: payload.auto_approved,
       }),
-      output: joinedOutput(payload),
+      output: identityOnly ? undefined : joinedOutput(payload),
       failed: isFailed(payload),
     };
   }
@@ -173,66 +174,58 @@ function responseItemKey(entry) {
   return `${kind}\0${id}`;
 }
 
-function deduplicateCodexToolEvents(rolloutEntries) {
-  const entries = [];
-  const responseItems = new Set();
-  for (const entry of rolloutEntries || []) {
+function toolEventIndex() {
+  const seen = new Set();
+  const winner = new Map();
+  const completedNames = new Map();
+  const responseNames = new Map();
+  const omit = new Set();
+  function observe(entry, pos) {
     const key = responseItemKey(entry);
-    if (key && responseItems.has(key)) continue;
-    if (key) responseItems.add(key);
-    entries.push(entry);
-  }
-
-  const completedTools = new Map();
-  const preferredCompleted = new Map();
-  for (const entry of entries) {
-    const tool = completedToolEvent(entry);
-    if (!tool?.id || !tool.name) continue;
-    completedTools.set(entry, tool);
-    const key = completedToolKey(tool);
-    const previous = preferredCompleted.get(key);
-    if (!previous || completedToolPriority(entry) >= completedToolPriority(previous)) {
-      preferredCompleted.set(key, entry);
+    if (key && seen.has(key)) {
+      omit.add(pos);
+      return;
     }
-  }
-  const completedNamesById = new Map();
-  for (const entry of preferredCompleted.values()) {
-    const tool = completedTools.get(entry);
-    const names = completedNamesById.get(tool.id) ?? new Set();
-    names.add(tool.name);
-    completedNamesById.set(tool.id, names);
-  }
-  const responseNamesById = new Map();
-  for (const entry of entries) {
-    const payload = entry?.payload;
-    if (
-      entry?.type === "response_item"
-      && RESPONSE_TOOL_TYPES.has(payload?.type)
-      && payload?.name
-    ) {
-      responseNamesById.set(payload.call_id || payload.id, payload.name);
-    }
-  }
-
-  return entries.flatMap((entry) => {
-    const tool = completedTools.get(entry);
+    if (key) seen.add(key);
+    const tool = completedToolEvent(entry, true);
     if (tool?.id && tool.name) {
-      return preferredCompleted.get(completedToolKey(tool)) === entry ? [entry] : [];
+      const group = completedToolKey(tool);
+      const priority = completedToolPriority(entry);
+      const prev = winner.get(group);
+      if (prev && priority < prev.priority) {
+        omit.add(pos);
+        return;
+      }
+      if (prev) omit.add(prev.pos);
+      winner.set(group, { pos, priority });
+      const names = completedNames.get(tool.id) ?? new Set();
+      names.add(tool.name);
+      completedNames.set(tool.id, names);
     }
+    const payload = entry?.payload;
+    if (entry?.type === "response_item" && RESPONSE_TOOL_TYPES.has(payload?.type) && payload.name) {
+      responseNames.set(payload.call_id || payload.id, payload.name);
+    }
+  }
+  function select(entry, pos) {
+    if (omit.has(pos)) return null;
     const payload = entry?.payload;
     const id = payload?.call_id || payload?.id;
-    const name = payload?.name || responseNamesById.get(id);
-    const completedNames = completedNamesById.get(id);
-    if (!RESPONSE_TOOL_TYPES.has(payload?.type) || !completedNames) return [entry];
-    if (completedNames.has(name)) return [];
-    if (name === "exec") {
-      return [{
-        ...entry,
-        payload: { ...payload, call_id: `codex-container:${id}` },
-      }];
+    const names = completedNames.get(id);
+    if (names && RESPONSE_TOOL_TYPES.has(payload?.type)) {
+      const name = payload.name || responseNames.get(id);
+      if (names.has(name) || name !== "exec") return null;
+      entry = { ...entry, payload: { ...payload, call_id: `codex-container:${id}` } };
     }
-    return [];
-  });
+    return entry;
+  }
+  return { observe, select };
+}
+
+function deduplicateCodexToolEvents(entries) {
+  const index = toolEventIndex();
+  entries.forEach(index.observe);
+  return entries.map(index.select).filter((entry) => entry != null);
 }
 
 function agentMessageText(payload) {
@@ -442,4 +435,51 @@ export function extractCaptureTranscript(rolloutEntries, cfg = {}) {
 
 export function extractCaptureTurns(rolloutEntries, cfg = {}) {
   return extractCaptureTranscript(rolloutEntries, cfg).turns;
+}
+
+// A Codex rollout can contain hundreds of MiB of tool output and compacted
+// history. Keep only cross-record identities between passes over the same fd.
+export async function extractRolloutStream(records, cfg, skipTurns) {
+  const index = toolEventIndex();
+  let pos = 0;
+  for await (const record of records()) {
+    for (const entry of expandCodexRolloutEntries([record])) index.observe(entry, pos++);
+  }
+  async function* normalized() {
+    let pos = 0;
+    for await (const record of records()) {
+      for (const entry of expandCodexRolloutEntries([record])) {
+        const selected = index.select(entry, pos++);
+        if (!selected) continue;
+        yield* normalizeCodexCompletedToolEvents(normalizeCodexNativeToolEvents([selected]));
+      }
+    }
+  }
+  const toolNames = {};
+  for await (const entry of normalized()) {
+    Object.assign(toolNames, collectToolNamesByIdFromEntries([entry]));
+  }
+  const turns = [];
+  const excludedLegacyTurnIndices = [];
+  let beforeFirstTurn = true;
+  let legacyCount = 0;
+  function append(batch) {
+    for (const turn of batch) {
+      // The caller only reads the tail. Preserve the index space for its cursor.
+      if (turns.length < skipTurns) turns.length += 1;
+      else turns.push(turn);
+    }
+  }
+  for await (const entry of normalized()) {
+    if (entry?.type === "turn_context") beforeFirstTurn = false;
+    if (beforeFirstTurn) {
+      const filtered = withoutStartupContext([entry], cfg);
+      if (filtered.excludedLegacyTurnIndices.length) excludedLegacyTurnIndices.push(legacyCount);
+      legacyCount += extractSharedCaptureTurns([entry], cfg, toolNames).length;
+      append(extractSharedCaptureTurns(filtered.entries, cfg, toolNames));
+    } else {
+      append(extractSharedCaptureTurns([entry], cfg, toolNames));
+    }
+  }
+  return { turns, excludedLegacyTurnIndices };
 }

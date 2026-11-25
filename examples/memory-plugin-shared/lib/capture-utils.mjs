@@ -510,8 +510,7 @@ export function shapeCapturePayload(payload, role, cfg = {}, { toolNameById = {}
   return { parts, text: decision.shouldCapture ? decision.text : "", signalText: signalText || "", dropped: false };
 }
 
-export function extractCaptureTurns(rolloutEntries, cfg = {}) {
-  const toolNameById = collectToolNamesByIdFromEntries(rolloutEntries);
+export function extractCaptureTurns(rolloutEntries, cfg = {}, toolNameById = collectToolNamesByIdFromEntries(rolloutEntries)) {
   const turns = [];
   for (const entry of rolloutEntries || []) {
     if (!entry || typeof entry !== "object") continue;
